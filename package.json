@@ -1,0 +1,17 @@
+{
+  "name": "phatnguoi-api",
+  "version": "3.0.0",
+  "description": "API tra cứu phạt nguội - bypass Cloudflare Turnstile via EzSolver",
+  "type": "module",
+  "main": "phatnguoi_api.js",
+  "scripts": {
+    "start": "node phatnguoi_api.js",
+    "dev": "node --watch phatnguoi_api.js"
+  },
+  "keywords": ["phatnguoi", "traffic-violation", "vietnam"],
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1"
+  }
+}

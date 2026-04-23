@@ -1,0 +1,493 @@
+/**
+ * PhatNguoi API Server - Tra cứu phạt nguội qua CLI trên VPS
+ * 
+ * Kiến trúc:
+ *   1. EzSolver (Python, port 8191) → bypass Cloudflare Turnstile
+ *   2. Server này (Node.js, port 3001) → proxy API + expose REST endpoint
+ * 
+ * Cách hoạt động:
+ *   - Lấy Turnstile token từ EzSolver service
+ *   - Gọi api.phatnguoi.com/v1/violations với token + HMAC signature
+ *   - Parse kết quả và trả về JSON sạch
+ * 
+ * LƯU Ý QUAN TRỌNG:
+ *   - Turnstile token là SINGLE-USE: mỗi token chỉ dùng được 1 request
+ *   - bypassCache=true yêu cầu token MỚI (token cũ sẽ bị 403)
+ *   - Luôn invalidate token sau mỗi lần gọi API
+ * 
+ * Sử dụng trên VPS:
+ *   1. python EzSolver/service.py   (chạy trước)
+ *   2. node phatnguoi_api.js        (chạy API)
+ *   3. curl "http://localhost:3001/api/lookup?plate=51L57382"
+ */
+
+import express from 'express';
+import cors from 'cors';
+import crypto from 'crypto';
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ==================== CẤU HÌNH ====================
+const CONFIG = {
+    // EzSolver service
+    EZSOLVER_URL: process.env.EZSOLVER_URL || 'http://localhost:8191/solve',
+    
+    // PhatNguoi.com Turnstile
+    SITE_KEY: '0x4AAAAAAAeYZSLe26PNB1mK',
+    SITE_URL: 'https://phatnguoi.com/',
+    
+    // PhatNguoi.com direct API
+    API_URL: 'https://api.phatnguoi.com/v1/violations',
+    API_SECRET: 'e6263836144c1a04ece5644347f8d221f1ca112a1d183efe831f361f97ab63ef',
+    
+    // Solver timeout
+    SOLVER_TIMEOUT: 60,
+};
+
+// ==================== TOKEN MANAGEMENT ====================
+// Token Turnstile là single-use nên KHÔNG cache.
+// Mỗi lần tra cứu cần lấy token mới từ EzSolver.
+let tokenFetching = false;
+let tokenQueue = [];
+
+/**
+ * Lấy Turnstile token mới từ EzSolver (mỗi lần luôn lấy mới)
+ */
+async function getTurnstileToken() {
+    // Nếu đang fetch, đợi kết quả
+    if (tokenFetching) {
+        console.log('[TOKEN] ⏳ Đang chờ token từ request khác...');
+        return new Promise((resolve, reject) => {
+            tokenQueue.push({ resolve, reject });
+        });
+    }
+    
+    tokenFetching = true;
+    console.log('[TOKEN] 🔐 Gửi yêu cầu giải Turnstile tới EzSolver...');
+    
+    try {
+        const startTime = Date.now();
+        const response = await fetch(CONFIG.EZSOLVER_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                sitekey: CONFIG.SITE_KEY,
+                siteurl: CONFIG.SITE_URL,
+                timeout: CONFIG.SOLVER_TIMEOUT
+            })
+        });
+        
+        const data = await response.json();
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        
+        if (data.token) {
+            console.log(`[TOKEN] ✅ Đã nhận token mới (${elapsed}s): ${data.token.substring(0, 30)}...`);
+            
+            // Giải phóng queue chờ (mỗi waiter cần token riêng nhưng EzSolver 
+            // serialize nên chỉ 1 token tại 1 thời điểm)
+            tokenQueue.forEach(q => q.resolve(data.token));
+            tokenQueue = [];
+            
+            return data.token;
+        } else {
+            throw new Error(data.error || 'EzSolver không trả về token');
+        }
+    } catch (err) {
+        console.error(`[TOKEN] ❌ Lỗi: ${err.message}`);
+        tokenQueue.forEach(q => q.reject(err));
+        tokenQueue = [];
+        throw err;
+    } finally {
+        tokenFetching = false;
+    }
+}
+
+// ==================== API SIGNING ====================
+
+/**
+ * Tạo HMAC-SHA256 signature cho API trực tiếp
+ */
+function createSignature(method, path, timestamp, body) {
+    const bodyStr = JSON.stringify(body);
+    const bodyHash = crypto.createHash('sha256').update(bodyStr).digest('hex');
+    const signString = `${method}\n${path}\n${timestamp}\n${bodyHash}`;
+    return crypto.createHmac('sha256', CONFIG.API_SECRET).update(signString).digest('hex');
+}
+
+// ==================== LOOKUP FUNCTIONS ====================
+
+/**
+ * Tra cứu qua API trực tiếp (api.phatnguoi.com)
+ * 
+ * LƯU Ý: Turnstile token là SINGLE-USE.
+ * bypassCache=false dùng cache server-side (nhanh, không tốn token phụ)
+ * bypassCache=true bắt CSGT trả data mới (cần token mới)
+ */
+async function lookupDirectAPI(plate, vehicleType, token, bypassCache = false) {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const payload = {
+        licensePlate: plate,
+        vehicleType: vehicleType,
+        userType: 'standard',
+        bypassCache: bypassCache
+    };
+    
+    const signature = createSignature('POST', '/v1/violations', timestamp, payload);
+    
+    console.log(`[API] 📡 Gọi API: biển=${plate}, loại=${vehicleType}, bypassCache=${bypassCache}`);
+    
+    const response = await fetch(CONFIG.API_URL, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Platform': 'web',
+            'X-Timestamp': timestamp,
+            'X-Signature': signature,
+            'X-Turnstile-Token': token,
+            'Origin': 'https://phatnguoi.com',
+            'Referer': 'https://phatnguoi.com/',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        },
+        body: JSON.stringify(payload)
+    });
+    
+    const httpStatus = response.status;
+    let result;
+    
+    try {
+        result = await response.json();
+    } catch (e) {
+        throw new Error(`API trả về không phải JSON (HTTP ${httpStatus})`);
+    }
+    
+    // Xử lý lỗi HTTP (4xx, 5xx)
+    if (httpStatus >= 400) {
+        const errCode = result.error?.code || 'UNKNOWN';
+        const errMsg = result.error?.message || `HTTP ${httpStatus}`;
+        console.log(`[API] ❌ Lỗi HTTP ${httpStatus}: ${errCode} - ${errMsg}`);
+        return { _error: true, _httpStatus: httpStatus, error: result.error };
+    }
+    
+    // Log kết quả
+    const vd = result.violationData || {};
+    const cacheInfo = result.cache ? `(cache: ${result.cache.source}, stale: ${result.cache.isStale})` : '';
+    console.log(`[API] ✅ HTTP ${httpStatus}: ${vd.totalViolations || 0} vi phạm ${cacheInfo}`);
+    
+    return result;
+}
+
+// ==================== FORMAT KẾT QUẢ ====================
+
+/**
+ * Format kết quả từ direct API sang dạng sạch
+ * Mapping fields theo đúng script.min.js của phatnguoi.com
+ */
+function formatDirectAPIResult(plate, data) {
+    if (!data) return { success: false, plate, message: 'Không có dữ liệu' };
+    
+    // Lỗi từ API (HTTP 4xx/5xx)
+    if (data._error) {
+        const errCode = data.error?.code || 'UNKNOWN';
+        const errMsg = data.error?.message || 'Lỗi từ API';
+        return {
+            success: false,
+            plate,
+            error_code: errCode,
+            message: errMsg
+        };
+    }
+    
+    const vd = data.violationData || {};
+    const result = {
+        success: true,
+        plate: data.licensePlate || plate,
+        vehicle_type: data.vehicleType || '',
+        total_violations: vd.totalViolations || 0,
+        unhandled: vd.unhandledCount || 0,
+        handled: vd.handledCount || 0,
+        updated_at: vd.updatedAt || null,
+        is_stale: !!(data.cache && data.cache.isStale),
+        cache_source: data.cache?.source || '',
+        source: 'api.phatnguoi.com',
+        violations: []
+    };
+    
+    if (vd.violations && Array.isArray(vd.violations)) {
+        result.violations = vd.violations.map((v, i) => ({
+            stt: i + 1,
+            thoi_gian: v.violationTime || '',
+            dia_diem: v.violationLocation || '',
+            hanh_vi: v.violationBehavior || '',
+            muc_phat: v.penaltyAmount || '',
+            trang_thai: (v.status || '').toUpperCase(),
+            don_vi: v.handlingUnit || '',
+            noi_giai_quyet: v.resolutionAddress || v.handlingUnit || ''
+        }));
+    }
+    
+    return result;
+}
+
+// ==================== API ROUTES ====================
+
+/**
+ * Health check
+ */
+app.get('/health', async (req, res) => {
+    let solverOk = false;
+    try {
+        const r = await fetch('http://localhost:8191/health');
+        const d = await r.json();
+        solverOk = d.status === 'ok';
+    } catch (e) {}
+    
+    res.json({
+        status: 'ok',
+        solver: solverOk ? 'connected' : 'disconnected'
+    });
+});
+
+/**
+ * Tra cứu phạt nguội
+ * 
+ * Query params:
+ *   plate:   biển số xe (bắt buộc)
+ *   loaixe:  1=ô tô, 2=xe máy, 3=xe máy điện (mặc định: 1)
+ */
+app.get('/api/lookup', async (req, res) => {
+    let { plate, loaixe, type } = req.query;
+    
+    if (!plate) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Thiếu biển số xe. Ví dụ: /api/lookup?plate=51L57382' 
+        });
+    }
+    
+    // Chuẩn hoá
+    plate = plate.replace(/[-.\s]/g, '').toUpperCase();
+    loaixe = loaixe || type || '1';
+    const vehicleType = loaixe === '2' ? 'motorbike' : loaixe === '3' ? 'electricbike' : 'car';
+    
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[LOOKUP] 🔍 Biển số: ${plate} | Loại xe: ${getLoaixeText(loaixe)} (${vehicleType})`);
+    console.log(`${'='.repeat(60)}`);
+    
+    try {
+        // Bước 1: Lấy Turnstile token MỚI (single-use)
+        const token = await getTurnstileToken();
+        
+        // Bước 2: Gọi API
+        let rawResult = await lookupDirectAPI(plate, vehicleType, token);
+        
+        // Nếu token bị reject -> lấy token mới và thử lại
+        if (rawResult._error && rawResult.error?.code === 'TURNSTILE_FAILED') {
+            console.log('[LOOKUP] ⚠️  Token bị reject, đang lấy token mới...');
+            const newToken = await getTurnstileToken();
+            rawResult = await lookupDirectAPI(plate, vehicleType, newToken);
+        }
+        
+        const formattedResult = formatDirectAPIResult(plate, rawResult);
+        
+        console.log(`[LOOKUP] 📊 Kết quả: ${formattedResult.total_violations || 0} vi phạm (${formattedResult.unhandled || 0} chưa xử phạt)`);
+        res.json(formattedResult);
+        
+    } catch (error) {
+        console.error(`[LOOKUP] ❌ Lỗi: ${error.message}`);
+        res.status(500).json({
+            success: false,
+            plate,
+            message: error.message,
+            hint: 'Kiểm tra EzSolver có đang chạy không: curl http://localhost:8191/health'
+        });
+    }
+});
+
+/**
+ * Tra cứu phạt nguội - POST
+ */
+app.post('/api/lookup', async (req, res) => {
+    let { plate, loaixe, type } = req.body;
+    
+    if (!plate) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Thiếu biển số xe. Gửi {"plate": "51L57382"}' 
+        });
+    }
+    
+    plate = plate.replace(/[-.\s]/g, '').toUpperCase();
+    loaixe = loaixe || type || '1';
+    const vehicleType = loaixe === '2' ? 'motorbike' : loaixe === '3' ? 'electricbike' : 'car';
+    
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[LOOKUP] 🔍 Biển số: ${plate} | Loại xe: ${getLoaixeText(loaixe)} (${vehicleType})`);
+    console.log(`${'='.repeat(60)}`);
+    
+    try {
+        const token = await getTurnstileToken();
+        let rawResult = await lookupDirectAPI(plate, vehicleType, token);
+        
+        if (rawResult._error && rawResult.error?.code === 'TURNSTILE_FAILED') {
+            console.log('[LOOKUP] ⚠️  Token bị reject, đang lấy token mới...');
+            const newToken = await getTurnstileToken();
+            rawResult = await lookupDirectAPI(plate, vehicleType, newToken);
+        }
+        
+        const formattedResult = formatDirectAPIResult(plate, rawResult);
+        console.log(`[LOOKUP] 📊 Kết quả: ${formattedResult.total_violations || 0} vi phạm`);
+        res.json(formattedResult);
+    } catch (error) {
+        console.error(`[LOOKUP] ❌ Lỗi: ${error.message}`);
+        res.status(500).json({ success: false, plate, message: error.message });
+    }
+});
+
+/**
+ * Tra cứu đăng kiểm (qua API trực tiếp)
+ */
+app.get('/api/dangkiem', async (req, res) => {
+    let { plate, tem, bien } = req.query;
+    
+    if (!plate) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Thiếu biển số xe. Ví dụ: /api/dangkiem?plate=30A12345&tem=KC2860472' 
+        });
+    }
+    
+    plate = plate.replace(/[-.\s]/g, '').toUpperCase();
+    bien = bien || 'T';
+    tem = (tem || '').replace(/[-.\s]/g, '').toUpperCase();
+    
+    if (!tem) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Thiếu tem đăng kiểm. Ví dụ: /api/dangkiem?plate=30A12345&tem=KC2860472' 
+        });
+    }
+    
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[ĐĂNG KIỂM] 🔍 Biển: ${plate} | Tem: ${tem} | Màu biển: ${bien}`);
+    console.log(`${'='.repeat(60)}`);
+    
+    try {
+        const token = await getTurnstileToken();
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const payload = {
+            licensePlate: plate,
+            registrationCode: tem,
+            plateColor: bien
+        };
+        const signature = createSignature('POST', '/v1/inspection', timestamp, payload);
+        
+        const response = await fetch('https://api.phatnguoi.com/v1/inspection', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Platform': 'web',
+                'X-Timestamp': timestamp,
+                'X-Signature': signature,
+                'X-Turnstile-Token': token,
+                'Origin': 'https://phatnguoi.com',
+                'Referer': 'https://phatnguoi.com/',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            body: JSON.stringify(payload)
+        });
+        
+        if (response.status >= 400) {
+            const errData = await response.json();
+            return res.status(response.status).json({ 
+                success: false, plate, 
+                message: errData.error?.message || `HTTP ${response.status}` 
+            });
+        }
+        
+        const result = await response.json();
+        console.log(`[ĐĂNG KIỂM] ✅ Hoàn tất`);
+        res.json({ success: true, plate, source: 'api.phatnguoi.com (Đăng Kiểm)', data: result });
+        
+    } catch (error) {
+        console.error(`[ĐĂNG KIỂM] ❌ Lỗi: ${error.message}`);
+        res.status(500).json({ success: false, plate, message: error.message });
+    }
+});
+
+/**
+ * Lấy token mới (debug/admin)
+ */
+app.get('/api/token', async (req, res) => {
+    try {
+        const token = await getTurnstileToken();
+        res.json({ 
+            success: true, 
+            token: token.substring(0, 40) + '...',
+            note: 'Token là single-use, chỉ dùng được cho 1 request API'
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ==================== HELPERS ====================
+
+function getLoaixeText(loaixe) {
+    switch (String(loaixe)) {
+        case '1': return 'Ô tô';
+        case '2': return 'Xe máy';
+        case '3': return 'Xe máy điện';
+        default: return 'Ô tô';
+    }
+}
+
+// ==================== KHỞI ĐỘNG ====================
+
+app.listen(PORT, () => {
+    console.log(`
+╔══════════════════════════════════════════════════════════╗
+║         🚗 PhatNguoi API Server v3.0                    ║
+║         Tra cứu phạt nguội qua CLI                      ║
+╠══════════════════════════════════════════════════════════╣
+║  Server:  http://localhost:${PORT}                        ║
+║  Solver:  ${CONFIG.EZSOLVER_URL}              ║
+╠══════════════════════════════════════════════════════════╣
+║  ENDPOINTS:                                              ║
+║                                                          ║
+║  GET /health                                             ║
+║      → Kiểm tra trạng thái server + solver               ║
+║                                                          ║
+║  GET /api/lookup?plate=51L57382&loaixe=1                 ║
+║      → Tra cứu phạt nguội CSGT                           ║
+║      loaixe: 1=ô tô, 2=xe máy, 3=xe điện                ║
+║                                                          ║
+║  GET /api/dangkiem?plate=30A12345&tem=KC2860472           ║
+║      → Tra cứu thông tin đăng kiểm                       ║
+║                                                          ║
+║  GET /api/token                                           ║
+║      → Lấy Turnstile token (debug)                       ║
+╠══════════════════════════════════════════════════════════╣
+║  VPS USAGE (curl):                                       ║
+║  curl "http://localhost:${PORT}/api/lookup?plate=51L57382" ║
+╚══════════════════════════════════════════════════════════╝
+`);
+    
+    checkSolver();
+});
+
+async function checkSolver() {
+    try {
+        const r = await fetch('http://localhost:8191/health');
+        const d = await r.json();
+        if (d.status === 'ok') {
+            console.log(`[STARTUP] ✅ EzSolver đã kết nối (${d.workers} worker, ${d.active} active)`);
+        }
+    } catch (e) {
+        console.log('[STARTUP] ⚠️  EzSolver chưa chạy! Hãy chạy: python EzSolver/service.py');
+    }
+}
