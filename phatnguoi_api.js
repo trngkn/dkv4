@@ -109,7 +109,7 @@ async function getTurnstileToken() {
 async function solveViaEzSolver() {
     const response = await fetch(CONFIG.EZSOLVER_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
         body: JSON.stringify({
             sitekey: CONFIG.SITE_KEY,
             siteurl: CONFIG.SITE_URL,
