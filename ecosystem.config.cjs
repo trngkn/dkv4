@@ -13,7 +13,7 @@ module.exports = {
     {
       // === EzSolver - Bypass Cloudflare Turnstile ===
       name: 'ezsolver',
-      script: '/usr/bin/python3',
+      script: '/usr/bin/python3.11',
       args: '-u service.py',
       cwd: './EzSolver',
       env: {

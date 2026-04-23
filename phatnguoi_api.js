@@ -34,8 +34,15 @@ app.use(express.urlencoded({ extended: true }));
 
 // ==================== CẤU HÌNH ====================
 const CONFIG = {
-    // EzSolver service
+    // Chế độ giải Turnstile: 'ezsolver' hoặc 'capsolver'
+    SOLVER_MODE: process.env.SOLVER_MODE || 'ezsolver',
+    
+    // EzSolver service (local Chrome automation)
     EZSOLVER_URL: process.env.EZSOLVER_URL || 'http://localhost:8191/solve',
+    
+    // CapSolver (dịch vụ giải captcha trả phí, ~$1-2/1000 lần)
+    // Đăng ký tại: https://www.capsolver.com
+    CAPSOLVER_KEY: process.env.CAPSOLVER_KEY || '',
     
     // PhatNguoi.com Turnstile
     SITE_KEY: '0x4AAAAAAAeYZSLe26PNB1mK',
@@ -51,15 +58,14 @@ const CONFIG = {
 
 // ==================== TOKEN MANAGEMENT ====================
 // Token Turnstile là single-use nên KHÔNG cache.
-// Mỗi lần tra cứu cần lấy token mới từ EzSolver.
+// Mỗi lần tra cứu cần lấy token mới.
 let tokenFetching = false;
 let tokenQueue = [];
 
 /**
- * Lấy Turnstile token mới từ EzSolver (mỗi lần luôn lấy mới)
+ * Lấy Turnstile token - tự chọn backend theo SOLVER_MODE
  */
 async function getTurnstileToken() {
-    // Nếu đang fetch, đợi kết quả
     if (tokenFetching) {
         console.log('[TOKEN] ⏳ Đang chờ token từ request khác...');
         return new Promise((resolve, reject) => {
@@ -68,35 +74,25 @@ async function getTurnstileToken() {
     }
     
     tokenFetching = true;
-    console.log('[TOKEN] 🔐 Gửi yêu cầu giải Turnstile tới EzSolver...');
+    const mode = CONFIG.SOLVER_MODE;
+    console.log(`[TOKEN] 🔐 Giải Turnstile qua ${mode}...`);
     
     try {
         const startTime = Date.now();
-        const response = await fetch(CONFIG.EZSOLVER_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                sitekey: CONFIG.SITE_KEY,
-                siteurl: CONFIG.SITE_URL,
-                timeout: CONFIG.SOLVER_TIMEOUT
-            })
-        });
+        let token;
         
-        const data = await response.json();
-        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        
-        if (data.token) {
-            console.log(`[TOKEN] ✅ Đã nhận token mới (${elapsed}s): ${data.token.substring(0, 30)}...`);
-            
-            // Giải phóng queue chờ (mỗi waiter cần token riêng nhưng EzSolver 
-            // serialize nên chỉ 1 token tại 1 thời điểm)
-            tokenQueue.forEach(q => q.resolve(data.token));
-            tokenQueue = [];
-            
-            return data.token;
+        if (mode === 'capsolver') {
+            token = await solveViaCapsolver();
         } else {
-            throw new Error(data.error || 'EzSolver không trả về token');
+            token = await solveViaEzSolver();
         }
+        
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        console.log(`[TOKEN] ✅ Đã nhận token (${elapsed}s): ${token.substring(0, 30)}...`);
+        
+        tokenQueue.forEach(q => q.resolve(token));
+        tokenQueue = [];
+        return token;
     } catch (err) {
         console.error(`[TOKEN] ❌ Lỗi: ${err.message}`);
         tokenQueue.forEach(q => q.reject(err));
@@ -105,6 +101,81 @@ async function getTurnstileToken() {
     } finally {
         tokenFetching = false;
     }
+}
+
+/**
+ * Backend 1: EzSolver (local Chrome, cần Xvfb trên VPS)
+ */
+async function solveViaEzSolver() {
+    const response = await fetch(CONFIG.EZSOLVER_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            sitekey: CONFIG.SITE_KEY,
+            siteurl: CONFIG.SITE_URL,
+            timeout: CONFIG.SOLVER_TIMEOUT
+        })
+    });
+    const data = await response.json();
+    if (data.token) return data.token;
+    throw new Error(data.error || 'EzSolver không trả về token');
+}
+
+/**
+ * Backend 2: CapSolver (dịch vụ trả phí, không cần Chrome)
+ * Đăng ký: https://www.capsolver.com → lấy API key
+ * Giá: ~$1-2 / 1000 lần giải
+ */
+async function solveViaCapsolver() {
+    if (!CONFIG.CAPSOLVER_KEY) {
+        throw new Error('Chưa cấu hình CAPSOLVER_KEY. Set env: CAPSOLVER_KEY=your_key');
+    }
+    
+    // Bước 1: Tạo task
+    const createRes = await fetch('https://api.capsolver.com/createTask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            clientKey: CONFIG.CAPSOLVER_KEY,
+            task: {
+                type: 'AntiTurnstileTaskProxyLess',
+                websiteURL: CONFIG.SITE_URL,
+                websiteKey: CONFIG.SITE_KEY,
+            }
+        })
+    });
+    const createData = await createRes.json();
+    
+    if (createData.errorId !== 0) {
+        throw new Error(`CapSolver createTask: ${createData.errorDescription || 'Unknown error'}`);
+    }
+    
+    const taskId = createData.taskId;
+    console.log(`[CAPSOLVER] Task created: ${taskId}`);
+    
+    // Bước 2: Poll kết quả
+    for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        
+        const resultRes = await fetch('https://api.capsolver.com/getTaskResult', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                clientKey: CONFIG.CAPSOLVER_KEY,
+                taskId: taskId
+            })
+        });
+        const resultData = await resultRes.json();
+        
+        if (resultData.status === 'ready') {
+            return resultData.solution?.token;
+        }
+        if (resultData.errorId !== 0) {
+            throw new Error(`CapSolver: ${resultData.errorDescription}`);
+        }
+    }
+    
+    throw new Error('CapSolver timeout sau 60s');
 }
 
 // ==================== API SIGNING ====================
@@ -449,31 +520,22 @@ function getLoaixeText(loaixe) {
 // ==================== KHỞI ĐỘNG ====================
 
 app.listen(PORT, () => {
+    const solverInfo = CONFIG.SOLVER_MODE === 'capsolver' 
+        ? 'CapSolver (API)' 
+        : CONFIG.EZSOLVER_URL;
+    
     console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║         🚗 PhatNguoi API Server v3.0                    ║
+║         🚗 PhatNguoi API Server v3.1                    ║
 ║         Tra cứu phạt nguội qua CLI                      ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Server:  http://localhost:${PORT}                        ║
-║  Solver:  ${CONFIG.EZSOLVER_URL}              ║
+║  Solver:  ${solverInfo.padEnd(42)}║
+║  Mode:    ${CONFIG.SOLVER_MODE.padEnd(42)}║
 ╠══════════════════════════════════════════════════════════╣
-║  ENDPOINTS:                                              ║
-║                                                          ║
-║  GET /health                                             ║
-║      → Kiểm tra trạng thái server + solver               ║
-║                                                          ║
 ║  GET /api/lookup?plate=51L57382&loaixe=1                 ║
-║      → Tra cứu phạt nguội CSGT                           ║
-║      loaixe: 1=ô tô, 2=xe máy, 3=xe điện                ║
-║                                                          ║
 ║  GET /api/dangkiem?plate=30A12345&tem=KC2860472           ║
-║      → Tra cứu thông tin đăng kiểm                       ║
-║                                                          ║
-║  GET /api/token                                           ║
-║      → Lấy Turnstile token (debug)                       ║
-╠══════════════════════════════════════════════════════════╣
-║  VPS USAGE (curl):                                       ║
-║  curl "http://localhost:${PORT}/api/lookup?plate=51L57382" ║
+║  GET /health                                             ║
 ╚══════════════════════════════════════════════════════════╝
 `);
     
@@ -481,6 +543,15 @@ app.listen(PORT, () => {
 });
 
 async function checkSolver() {
+    if (CONFIG.SOLVER_MODE === 'capsolver') {
+        if (CONFIG.CAPSOLVER_KEY) {
+            console.log('[STARTUP] ✅ CapSolver mode (API key configured)');
+        } else {
+            console.log('[STARTUP] ❌ CapSolver mode nhưng chưa set CAPSOLVER_KEY!');
+        }
+        return;
+    }
+    
     try {
         const r = await fetch('http://localhost:8191/health');
         const d = await r.json();
