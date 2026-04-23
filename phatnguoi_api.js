@@ -56,6 +56,22 @@ const CONFIG = {
     SOLVER_TIMEOUT: 60,
 };
 
+// ==================== REQUEST QUEUE ====================
+// Chỉ xử lý 1 request tra cứu tại 1 thời điểm.
+// Request tiếp theo phải đợi request trước hoàn tất.
+let requestChain = Promise.resolve();
+let queueSize = 0;
+
+function enqueue(fn) {
+    queueSize++;
+    if (queueSize > 1) {
+        console.log(`[QUEUE] ⏳ Đang chờ... (${queueSize - 1} request phía trước)`);
+    }
+    const task = requestChain.then(() => fn()).finally(() => { queueSize--; });
+    requestChain = task.catch(() => {}); // Đảm bảo chain không bị reject
+    return task;
+}
+
 // ==================== TOKEN MANAGEMENT ====================
 // Token Turnstile là single-use nên KHÔNG cache.
 // Mỗi lần tra cứu cần lấy token mới.
@@ -340,41 +356,19 @@ app.get('/api/lookup', async (req, res) => {
         });
     }
     
-    // Chuẩn hoá
     plate = plate.replace(/[-.\s]/g, '').toUpperCase();
     loaixe = loaixe || type || '1';
     const vehicleType = loaixe === '2' ? 'motorbike' : loaixe === '3' ? 'electricbike' : 'car';
     
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`[LOOKUP] 🔍 Biển số: ${plate} | Loại xe: ${getLoaixeText(loaixe)} (${vehicleType})`);
-    console.log(`${'='.repeat(60)}`);
-    
     try {
-        // Bước 1: Lấy Turnstile token MỚI (single-use)
-        const token = await getTurnstileToken();
-        
-        // Bước 2: Gọi API
-        let rawResult = await lookupDirectAPI(plate, vehicleType, token);
-        
-        // Nếu token bị reject -> lấy token mới và thử lại
-        if (rawResult._error && rawResult.error?.code === 'TURNSTILE_FAILED') {
-            console.log('[LOOKUP] ⚠️  Token bị reject, đang lấy token mới...');
-            const newToken = await getTurnstileToken();
-            rawResult = await lookupDirectAPI(plate, vehicleType, newToken);
-        }
-        
-        const formattedResult = formatDirectAPIResult(plate, rawResult);
-        
-        console.log(`[LOOKUP] 📊 Kết quả: ${formattedResult.total_violations || 0} vi phạm (${formattedResult.unhandled || 0} chưa xử phạt)`);
-        res.json(formattedResult);
-        
+        const result = await enqueue(() => doLookup(plate, vehicleType, loaixe));
+        res.json(result);
     } catch (error) {
         console.error(`[LOOKUP] ❌ Lỗi: ${error.message}`);
         res.status(500).json({
-            success: false,
-            plate,
+            success: false, plate,
             message: error.message,
-            hint: 'Kiểm tra EzSolver có đang chạy không: curl http://localhost:8191/health'
+            hint: 'Kiểm tra EzSolver/CapSolver'
         });
     }
 });
@@ -396,28 +390,41 @@ app.post('/api/lookup', async (req, res) => {
     loaixe = loaixe || type || '1';
     const vehicleType = loaixe === '2' ? 'motorbike' : loaixe === '3' ? 'electricbike' : 'car';
     
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`[LOOKUP] 🔍 Biển số: ${plate} | Loại xe: ${getLoaixeText(loaixe)} (${vehicleType})`);
-    console.log(`${'='.repeat(60)}`);
-    
     try {
-        const token = await getTurnstileToken();
-        let rawResult = await lookupDirectAPI(plate, vehicleType, token);
-        
-        if (rawResult._error && rawResult.error?.code === 'TURNSTILE_FAILED') {
-            console.log('[LOOKUP] ⚠️  Token bị reject, đang lấy token mới...');
-            const newToken = await getTurnstileToken();
-            rawResult = await lookupDirectAPI(plate, vehicleType, newToken);
-        }
-        
-        const formattedResult = formatDirectAPIResult(plate, rawResult);
-        console.log(`[LOOKUP] 📊 Kết quả: ${formattedResult.total_violations || 0} vi phạm`);
-        res.json(formattedResult);
+        const result = await enqueue(() => doLookup(plate, vehicleType, loaixe));
+        res.json(result);
     } catch (error) {
         console.error(`[LOOKUP] ❌ Lỗi: ${error.message}`);
         res.status(500).json({ success: false, plate, message: error.message });
     }
 });
+
+/**
+ * Logic tra cứu chung (dùng cho cả GET và POST)
+ * Hàm này chạy bên trong queue - đảm bảo chỉ 1 request tại 1 thời điểm
+ */
+async function doLookup(plate, vehicleType, loaixe) {
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`[LOOKUP] 🔍 Biển số: ${plate} | Loại xe: ${getLoaixeText(loaixe)} (${vehicleType})`);
+    console.log(`${'='.repeat(60)}`);
+    
+    // Bước 1: Lấy Turnstile token MỚI (single-use)
+    const token = await getTurnstileToken();
+    
+    // Bước 2: Gọi API
+    let rawResult = await lookupDirectAPI(plate, vehicleType, token);
+    
+    // Nếu token bị reject -> lấy token mới và thử lại
+    if (rawResult._error && rawResult.error?.code === 'TURNSTILE_FAILED') {
+        console.log('[LOOKUP] ⚠️  Token bị reject, đang lấy token mới...');
+        const newToken = await getTurnstileToken();
+        rawResult = await lookupDirectAPI(plate, vehicleType, newToken);
+    }
+    
+    const formattedResult = formatDirectAPIResult(plate, rawResult);
+    console.log(`[LOOKUP] 📊 Kết quả: ${formattedResult.total_violations || 0} vi phạm (${formattedResult.unhandled || 0} chưa xử phạt)`);
+    return formattedResult;
+}
 
 /**
  * Tra cứu đăng kiểm (qua API trực tiếp)
